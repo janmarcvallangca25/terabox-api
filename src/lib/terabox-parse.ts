@@ -76,10 +76,9 @@ export function extractLogId(html: string): string {
 
 /** True when the page is a password gate rather than a file listing. */
 export function looksPasswordProtected(html: string): boolean {
-  return (
-    /"share_type"\s*:\s*"?2/.test(html) ||
-    /accessCode|access_code|pwd-?input|extraction[- ]code|verify-?form/i.test(html)
-  );
+  // Do not treat generic JavaScript references to password
+  // functionality as proof that this share is protected.
+  return /"share_type"\s*:\s*"?2(?:["},\s]|$)/.test(html);
 }
 
 /** True when TeraBox is serving its CAPTCHA wall instead of the share. */
