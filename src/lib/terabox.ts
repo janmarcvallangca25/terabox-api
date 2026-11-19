@@ -143,55 +143,131 @@ function listParams(context: ShareContext, shareId: string, dir?: string): URLSe
  * The landing fetch follows redirects, so a single request covers short-link
  * expansion and the page HTML together.
  */
+
 export async function openShare(
   link: string,
   cookie: string,
   budget: Budget,
 ): Promise<ShareContext> {
-  const response = await budget.fetch(link, {
-    headers: { ...BASE_HEADERS, Cookie: cookie },
-    redirect: "follow",
-  });
+  const inputUrl = new URL(link);
+  const shareId = extractShareId(inputUrl);
 
-  if (response.status === 404 || response.status === 410) {
-    throw ApiError.notFound("That share link doesn't exist or has been deleted.");
-  }
-  if (!response.ok) {
-    throw ApiError.upstream(`Failed to open the share link (status ${response.status}).`, {
-      status: response.status,
-    });
-  }
-
-  const resolvedUrl = response.url || link;
-  const html = await response.text();
-
-  let shareId: string | null = null;
-  for (const candidate of [resolvedUrl, link]) {
-    try {
-      shareId = extractShareId(new URL(candidate));
-    } catch {
-      shareId = null;
-    }
-    if (shareId) break;
-  }
   if (!shareId) {
     throw ApiError.upstreamUnexpected(
       "Could not find a share id on that link. Check the URL was copied in full.",
     );
   }
 
-  return {
-    shareId,
-    origin: new URL(resolvedUrl).origin,
-    resolvedUrl,
-    jsToken: extractJsToken(html),
-    logId: extractLogId(html),
-    record: extractShareRecord(html),
-    cookie,
-    html,
-    passwordGate: looksPasswordProtected(html),
-  };
+  const surl = shareId.replace(/^1/, "");
+
+  const candidates = [
+    link,
+    ...MIRROR_ORIGINS.flatMap((origin) => [
+      `${origin}/s/${shareId}`,
+      `${origin}/wap/share/filelist?surl=${encodeURIComponent(surl)}`,
+    ]),
+  ];
+
+  const uniqueCandidates = [...new Set(candidates)];
+
+  let lastStatus: number | null = null;
+  let lastError: unknown = null;
+  let sawNotFound = false;
+
+  for (const candidate of uniqueCandidates) {
+    if (!budget.canAfford(2)) break;
+
+    try {
+      const isMobile = candidate.includes("/wap/");
+
+      const response = await budget.fetch(candidate, {
+        headers: {
+          ...BASE_HEADERS,
+          "User-Agent": isMobile ? MOBILE_UA : BROWSER_UA,
+          Cookie: cookie,
+          Referer: new URL(candidate).origin + "/",
+        },
+        redirect: "follow",
+        retries: 0,
+      });
+
+      lastStatus = response.status;
+
+      if (response.status === 404 || response.status === 410) {
+        sawNotFound = true;
+        log("warn", "share landing unavailable", {
+          origin: new URL(candidate).origin,
+          status: response.status,
+        });
+        continue;
+      }
+
+      if (!response.ok) {
+        log("warn", "share landing request failed", {
+          origin: new URL(candidate).origin,
+          status: response.status,
+        });
+        continue;
+      }
+
+      const html = await response.text();
+
+      if (!html.trim()) {
+        continue;
+      }
+
+      const resolvedUrl = response.url || candidate;
+
+      // Keep the ID from the original link, even when
+      // a mirror redirects to a different landing page.
+      const context: ShareContext = {
+        shareId,
+        origin: new URL(resolvedUrl).origin,
+        resolvedUrl,
+        jsToken: extractJsToken(html),
+        logId: extractLogId(html),
+        record: extractShareRecord(html),
+        cookie,
+        html,
+        passwordGate: looksPasswordProtected(html),
+      };
+
+      log("info", "share landing fetched", {
+        origin: context.origin,
+        mobile: isMobile,
+        has_token: Boolean(context.jsToken),
+      });
+
+      return context;
+    } catch (error) {
+      lastError = error;
+
+      log("warn", "share landing fetch exception", {
+        origin: new URL(candidate).origin,
+        message: error instanceof Error ? error.message : "unknown",
+      });
+    }
+  }
+
+  if (!budget.canAfford()) {
+    throw ApiError.budgetExhausted();
+  }
+
+  if (sawNotFound && lastStatus !== null) {
+    throw ApiError.notFound(
+      "TeraBox returned 404/410 for the attempted share pages. The share may be accessible in a browser but unavailable to this server.",
+    );
+  }
+
+  throw ApiError.upstream(
+    `Unable to open the share through available TeraBox domains. Last status: ${lastStatus ?? "unknown"}.`,
+    {
+      status: lastStatus,
+      reason: lastError instanceof Error ? lastError.message : "unknown",
+    },
+  );
 }
+
 
 /** Exchange a share password for the `randsk` unlock key. */
 export async function unlockShare(
@@ -279,12 +355,11 @@ async function callList(
       if (data.errno) {
         lastError = fromTeraboxErrno(data.errno, data.errmsg);
         // A password gate or a missing share is final — no mirror will differ.
-        if (
-          lastError.code === ErrorCode.PASSWORD_REQUIRED ||
-          lastError.code === ErrorCode.NOT_FOUND
-        ) {
-          throw lastError;
-        }
+        
+       if (lastError.code === ErrorCode.PASSWORD_REQUIRED) {
+  throw lastError;
+}
+
         continue;
       }
 
@@ -572,418 +647,4 @@ async function callTplConfig(
 
 /**
  * The mobile share page, read for its embedded share record and — for callers
- * that still lack one — a page token. One call, one origin: this is a
- * supplement to `callShortUrlInfo`, not another full sweep.
- */
-async function readWapRecord(
-  share: TeraboxShare,
-  cookie: string,
-  budget: Budget,
-): Promise<{ record: ShareRecord; jsToken: string } | null> {
-  if (!budget.canAfford(2)) return null;
-
-  const surl = share.shareId.replace(/^1/, "");
-  try {
-    const response = await budget.fetch(
-      `${share.origin}/wap/share/filelist?surl=${encodeURIComponent(surl)}`,
-      {
-        headers: { ...BASE_HEADERS, "User-Agent": MOBILE_UA, Cookie: cookie },
-        redirect: "follow",
-        retries: 0,
-      },
-    );
-    if (!response.ok) return null;
-
-    const html = await response.text();
-    return { record: extractShareRecord(html), jsToken: extractJsToken(html) };
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Fill in a share's missing signature.
- *
- * Every listing strategy can succeed without producing one, and nothing
- * downstream works without it: `freshDownloadLink` refuses to run and `/hls`
- * can't build a manifest URL. So a share that came back unsigned gets one more
- * chance here, from the three places that reliably carry it.
- *
- * `/share/tplconfig` is tried first when `shareid`/`uk` are already known
- * (the common case — the listing itself usually returns them even when it
- * can't return a signature): it's a single unauthenticated call for just the
- * missing `sign`/`timestamp` pair, and it isn't gated behind the `jsToken`
- * check that walls `/api/shorturlinfo` on some shares. Pairing its result
- * with the already-known `shareid`/`uk` is safe — TeraBox's signature is a
- * function of the share's `surl` and a server-side timestamp, not of which
- * request happened to carry the id fields alongside it, and this is exactly
- * how AList/OpenList's Baidu-share driver combines the two calls.
- *
- * Never throws and never makes things worse: the share you passed in comes
- * back untouched if nothing is found, because a listing without a signature
- * is still worth returning.
- */
-export async function hydrateShare(
-  share: TeraboxShare,
-  cookie: string,
-  budget: Budget,
-): Promise<TeraboxShare> {
-  const withKey = withUnlockKey(cookie, share.randsk);
-  let jsToken = share.jsToken;
-
-  try {
-    if (share.shareNumericId && share.uk) {
-      const pair = await callTplConfig(share, withKey, budget);
-      if (pair) return { ...share, sign: pair.sign, timestamp: pair.timestamp, jsToken };
-    }
-
-    let record = await callShortUrlInfo(share, withKey, jsToken, budget);
-
-    if (!record) {
-      const wap = await readWapRecord(share, withKey, budget);
-      if (wap && hasSignature(wap.record)) {
-        record = wap.record;
-        jsToken = jsToken || wap.jsToken;
-      } else if (wap?.jsToken && !jsToken) {
-        // The mobile page had no record, but it did have the token that the
-        // share-info endpoint may have been refusing to answer without.
-        jsToken = wap.jsToken;
-        record = await callShortUrlInfo(share, withKey, jsToken, budget);
-      }
-    }
-
-    // Take the record whole. The sign/timestamp pair is only valid together, so
-    // it must never be stitched together from two different sources.
-    if (record) return { ...share, ...record, jsToken };
-  } catch (err) {
-    log("warn", "share signature lookup failed", {
-      share_id: share.shareId,
-      code: err instanceof ApiError ? err.code : "unknown",
-    });
-    return share;
-  }
-
-  log("warn", "share exposed no signature", { share_id: share.shareId });
-  return share;
-}
-
-type StrategyName = TeraboxShare["strategy"];
-
-/**
- * How informative each failure is, highest first.
- *
- * When every strategy fails they each fail differently, and the last one to
- * run is rarely the most useful thing to tell the caller. A CAPTCHA wall is
- * actionable ("retry shortly"); an expired cookie is actionable ("rotate the
- * secret"); "the mobile page returned 403" is noise. So the most actionable
- * error is surfaced rather than the most recent.
- */
-const ERROR_PRIORITY: string[] = [
-  ErrorCode.VERIFICATION_REQUIRED,
-  ErrorCode.COOKIE_INVALID,
-  ErrorCode.EMPTY_SHARE,
-  ErrorCode.UPSTREAM_UNEXPECTED,
-  ErrorCode.UPSTREAM_UNAVAILABLE,
-];
-
-function moreInformative(candidate: ApiError, incumbent: ApiError | null): boolean {
-  if (!incumbent) return true;
-  const rank = (error: ApiError) => {
-    const index = ERROR_PRIORITY.indexOf(error.code);
-    return index === -1 ? ERROR_PRIORITY.length : index;
-  };
-  return rank(candidate) < rank(incumbent);
-}
-
-/**
- * Resolve a share link to its files.
- *
- * Three strategies are tried in order — signed, anonymous, then the WAP page
- * scrape. They fail in genuinely different ways (a stale token, a CAPTCHA
- * wall, a restructured payload), so trying all three is what keeps the API
- * working through TeraBox's frequent changes. Caching happens a layer up, in
- * `lib/cache.ts`, which keeps this a straightforward "go and ask" function.
- */
-export async function resolveShare(
-  link: string,
-  cookie: string,
-  budget: Budget,
-  options: ResolveOptions = {},
-): Promise<TeraboxShare> {
-  let context = await openShare(link, cookie, budget);
-
-  // A password gate is only a dead end when there's no password to offer.
-  // (This used to throw inside `openShare`, before the password was ever
-  // used — so a protected share could not be unlocked at all.)
-  if (context.passwordGate && !options.password) throw ApiError.passwordRequired();
-
-  let effectiveCookie = cookie;
-  let randsk = "";
-  if (options.password) {
-    randsk = await unlockShare(context, options.password, budget);
-    effectiveCookie = withUnlockKey(cookie, randsk);
-
-    if (context.passwordGate) {
-      // The gate page carries no token and no share record. Now that the share
-      // is unlocked, load it again to get the real page.
-      try {
-        const unlocked = await openShare(link, effectiveCookie, budget);
-        if (!unlocked.passwordGate) context = unlocked;
-      } catch {
-        // Carry on with what the gate page gave us; the listing can still work.
-      }
-    }
-  }
-
-  const strategies: {
-    name: StrategyName;
-    run: () => Promise<{ files: RawFile[]; record: ShareRecord }>;
-  }[] = [
-    { name: "signed", run: () => callList(context, effectiveCookie, budget, { anonymous: false }) },
-    {
-      name: "anonymous",
-      run: () => callList(context, effectiveCookie, budget, { anonymous: true }),
-    },
-    { name: "wap", run: () => callWap(context, effectiveCookie, budget) },
-  ];
-
-  // Without a jsToken the signed call is guaranteed to fail; skip the spend.
-  const usable = context.jsToken ? strategies : strategies.filter((s) => s.name !== "signed");
-
-  let lastError: ApiError | null = null;
-
-  for (const strategy of usable) {
-    if (!budget.canAfford()) break;
-
-    try {
-      const listing = await strategy.run();
-      const record = {
-        shareNumericId: listing.record.shareNumericId || context.record.shareNumericId,
-        uk: listing.record.uk || context.record.uk,
-        sign: listing.record.sign || context.record.sign,
-        timestamp: listing.record.timestamp || context.record.timestamp,
-      };
-
-      const { files, truncated } = await expandFolders(
-        context,
-        effectiveCookie,
-        budget,
-        strategy.name !== "signed",
-        listing.files,
-      );
-
-      if (files.length === 0) {
-        const empty = new ApiError(
-          ErrorCode.EMPTY_SHARE,
-          "This share contains no downloadable files.",
-          404,
-        );
-        if (moreInformative(empty, lastError)) lastError = empty;
-        continue;
-      }
-
-      const share: TeraboxShare = {
-        shareId: context.shareId,
-        shareNumericId: record.shareNumericId,
-        uk: record.uk,
-        sign: record.sign,
-        timestamp: record.timestamp,
-        randsk,
-        jsToken: context.jsToken,
-        origin: context.origin,
-        resolvedUrl: context.resolvedUrl,
-        files,
-        passwordProtected: Boolean(options.password),
-        truncated,
-        strategy: strategy.name,
-      };
-
-      // Listing succeeded, but the signature may not have come with it. Fetch
-      // it now, while the cookie and unlock key are to hand.
-      return hasSignature(share) ? share : await hydrateShare(share, effectiveCookie, budget);
-    } catch (err) {
-      const apiError = err instanceof ApiError ? err : ApiError.upstream(String(err));
-      // A password gate or a deleted share won't be fixed by another strategy.
-      if (
-        apiError.code === ErrorCode.PASSWORD_REQUIRED ||
-        apiError.code === ErrorCode.NOT_FOUND ||
-        apiError.code === ErrorCode.BUDGET_EXHAUSTED
-      ) {
-        throw apiError;
-      }
-      if (moreInformative(apiError, lastError)) lastError = apiError;
-    }
-  }
-
-  if (lastError) throw lastError;
-  if (!context.jsToken) {
-    throw ApiError.cookieInvalid(
-      "Could not extract a page token and every fallback failed. The TERABOX_COOKIE secret has most likely expired.",
-    );
-  }
-  throw ApiError.upstream("Every resolution strategy failed for this share.");
-}
-
-/** Pull the link out of whichever shape `/share/download` answered in. */
-function extractDlink(data: DownloadResponse): string {
-  if (typeof data.dlink === "string") return data.dlink;
-  return data.dlink?.[0]?.dlink || data.list?.[0]?.dlink || data.info?.[0]?.dlink || "";
-}
-
-/**
- * One `/share/download` attempt.
- *
- * `POST` is the Baidu-lineage form — signature in the query string, the file
- * selection in a form body. `GET` is the form the current web player sends,
- * with everything in the query string. Which one TeraBox is happy with has
- * changed before, so `freshDownloadLink` tries both.
- */
-async function requestDownloadLink(
-  share: TeraboxShare,
-  file: TeraboxFile,
-  cookie: string,
-  budget: Budget,
-  method: "POST" | "GET",
-): Promise<string> {
-  const params = new URLSearchParams({
-    app_id: "250528",
-    web: "1",
-    channel: "dubox",
-    clienttype: "0",
-    sign: share.sign,
-    timestamp: share.timestamp,
-  });
-  if (share.jsToken) params.set("jsToken", share.jsToken);
-
-  const fields = new URLSearchParams({
-    encrypt: "0",
-    product: "share",
-    uk: share.uk,
-    primaryid: share.shareNumericId,
-    fid_list: `[${file.fsId}]`,
-  });
-  if (share.randsk) fields.set("extra", JSON.stringify({ sekey: share.randsk }));
-
-  const headers: Record<string, string> = {
-    ...BASE_HEADERS,
-    Cookie: withUnlockKey(cookie, share.randsk),
-    Referer: share.resolvedUrl,
-  };
-
-  let response: Response;
-  if (method === "POST") {
-    fields.set("type", "nolimit");
-    headers["Content-Type"] = "application/x-www-form-urlencoded";
-    response = await budget.fetch(`${share.origin}/share/download?${params}`, {
-      method: "POST",
-      headers,
-      body: fields.toString(),
-    });
-  } else {
-    params.set("shareid", share.shareNumericId);
-    params.set("dp-logid", makeLogId());
-    params.set("nozip", "0");
-    for (const [key, value] of fields) params.set(key, value);
-    response = await budget.fetch(`${share.origin}/share/download?${params}`, { headers });
-  }
-
-  const data = await readJson<DownloadResponse>(response, "requesting a fresh download link");
-  if (data.errno) {
-    if (isStaleTokenErrno(data.errno)) {
-      throw ApiError.cookieInvalid(
-        "TeraBox rejected the signature while minting a download link. Try again; if it persists, refresh TERABOX_COOKIE.",
-      );
-    }
-    throw fromTeraboxErrno(data.errno, data.errmsg);
-  }
-
-  const link = extractDlink(data);
-  if (!link) throw ApiError.upstreamUnexpected("TeraBox returned no download link for this file.");
-  return link;
-}
-
-/** Failures that would repeat identically on the other request form. */
-const FINAL_DOWNLOAD_ERRORS: string[] = [
-  ErrorCode.COOKIE_INVALID,
-  ErrorCode.PASSWORD_REQUIRED,
-  ErrorCode.NOT_FOUND,
-  ErrorCode.VERIFICATION_REQUIRED,
-  ErrorCode.BUDGET_EXHAUSTED,
-];
-
-/**
- * Ask TeraBox for a freshly signed download URL for one file.
- *
- * Used when the listing returned no dlink, and again when a cached dlink has
- * expired — dlinks are short-lived, and this is the documented way to renew
- * one without re-resolving the whole share.
- *
- * Needs the share's signature. A share that lacks one should go through
- * `hydrateShare` first; this function refuses rather than send a request that
- * is certain to be rejected.
- */
-export async function freshDownloadLink(
-  share: TeraboxShare,
-  file: TeraboxFile,
-  cookie: string,
-  budget: Budget,
-): Promise<string> {
-  if (!hasSignature(share)) {
-    throw ApiError.upstreamUnexpected(
-      "This share did not expose the signature needed to mint a fresh download link.",
-    );
-  }
-
-  let lastError: ApiError | null = null;
-
-  for (const method of ["POST", "GET"] as const) {
-    if (method === "GET" && !budget.canAfford()) break;
-
-    try {
-      return await requestDownloadLink(share, file, cookie, budget, method);
-    } catch (err) {
-      if (!(err instanceof ApiError)) throw err;
-      if (FINAL_DOWNLOAD_ERRORS.includes(err.code)) throw err;
-      lastError = err;
-    }
-  }
-
-  throw lastError ?? ApiError.upstreamUnexpected("TeraBox returned no download link for this file.");
-}
-
-/**
- * Build the URL for TeraBox's own HLS manifest.
- *
- * This is what makes browser playback work for containers a `<video>` tag
- * can't handle directly, such as MKV and AVI.
- */
-export function streamingManifestUrl(
-  share: TeraboxShare,
-  file: TeraboxFile,
-  quality: string,
-): string {
-  const params = new URLSearchParams({
-    app_id: "250528",
-    channel: "dubox",
-    clienttype: "0",
-    web: "1",
-    uk: share.uk,
-    shareid: share.shareNumericId,
-    fid: file.fsId,
-    sign: share.sign,
-    timestamp: share.timestamp,
-    type: quality,
-    esl: "1",
-    isplayer: "1",
-  });
-  if (share.jsToken) params.set("jsToken", share.jsToken);
-  return `${share.origin}/share/streaming?${params}`;
-}
-
-/** Pick one file out of a resolved share, by fs_id or first-by-default. */
-export function selectFile(share: TeraboxShare, fsId?: string | null): TeraboxFile {
-  if (!fsId) return share.files[0]!;
-  const match = share.files.find((file) => file.fsId === fsId);
-  if (!match) throw ApiError.notFound(`No file with fs_id '${fsId}' in this share.`);
-  return match;
-}
+ * that still lack one — a page token. One call, one orig
